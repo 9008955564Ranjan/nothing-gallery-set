@@ -1,4 +1,3 @@
-import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -35,7 +34,7 @@ class GalleryScreen extends StatefulWidget {
 class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProviderStateMixin {
   List<AssetEntity> _images = [];
   bool _isLoading = true;
-  bool _permissionDenied = false;
+  bool _hasAccess = false;
   int _currentIndex = 0;
   Set<String> _favorites = {};
 
@@ -48,19 +47,19 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
     super.initState();
     _initHeartAnimation();
     _loadFavorites();
-    _fetchLocalImages();
+    _fetchImages();
   }
 
   void _initHeartAnimation() {
     _heartAnimController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 500),
+      duration: const Duration(milliseconds: 400),
     );
     _heartScale = Tween<double>(begin: 0.6, end: 1.3).animate(
       CurvedAnimation(parent: _heartAnimController, curve: Curves.easeOutBack),
     );
     _heartOpacity = Tween<double>(begin: 1.0, end: 0.0).animate(
-      CurvedAnimation(parent: _heartAnimController, curve: const Interval(0.6, 1.0, curve: Curves.easeIn)),
+      CurvedAnimation(parent: _heartAnimController, curve: const Interval(0.5, 1.0, curve: Curves.easeIn)),
     );
   }
 
@@ -76,35 +75,34 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
     await prefs.setStringList('favorite_ids', _favorites.toList());
   }
 
-  Future<void> _fetchLocalImages() async {
+  Future<void> _fetchImages() async {
+    // Android 14/15/16 supports limited or full access
     final PermissionState ps = await PhotoManager.requestPermissionExtend();
-    if (!ps.isAuth && !ps.hasAccess) {
-      setState(() {
-        _permissionDenied = true;
-        _isLoading = false;
-      });
-      return;
-    }
-
-    final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
-      type: RequestType.image,
-      onlyAll: true,
-    );
-
-    if (albums.isNotEmpty) {
-      final List<AssetEntity> media = await albums[0].getAssetListRange(
-        start: 0,
-        end: 1000,
+    
+    if (ps.isAuth || ps.hasAccess) {
+      final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
+        type: RequestType.image,
+        onlyAll: true,
       );
-      setState(() {
-        _images = media;
-        _isLoading = false;
-      });
-    } else {
-      setState(() {
-        _isLoading = false;
-      });
+
+      if (albums.isNotEmpty) {
+        final List<AssetEntity> media = await albums[0].getAssetListRange(
+          start: 0,
+          end: 500, // Load initial chunk for top performance
+        );
+        setState(() {
+          _images = media;
+          _hasAccess = true;
+          _isLoading = false;
+        });
+        return;
+      }
     }
+
+    setState(() {
+      _hasAccess = ps.isAuth || ps.hasAccess;
+      _isLoading = false;
+    });
   }
 
   void _toggleFavorite(String id) {
@@ -123,42 +121,16 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
     if (_images.isEmpty) return;
     final currentAsset = _images[_currentIndex];
 
-    final bool? confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        backgroundColor: const Color(0xFF121212),
-        shape: const RoundedRectangleBorder(
-          side: BorderSide(color: Colors.white24, width: 1),
-          borderRadius: BorderRadius.all(Radius.circular(8)),
-        ),
-        title: const Text('DELETE PHOTO?', style: TextStyle(color: Colors.white, fontSize: 16)),
-        content: const Text(
-          'This will permanently remove the file from your device.',
-          style: TextStyle(color: Colors.white70, fontSize: 12),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('CANCEL', style: TextStyle(color: Colors.white54)),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('DELETE', style: TextStyle(color: Color(0xFFD71921), fontWeight: FontWeight.bold)),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      final List<String> result = await PhotoManager.editor.deleteWithIds([currentAsset.id]);
-      if (result.isNotEmpty) {
-        setState(() {
-          _images.removeAt(_currentIndex);
-          if (_currentIndex >= _images.length && _images.isNotEmpty) {
-            _currentIndex = _images.length - 1;
-          }
-        });
-      }
+    // Under modern Android, PhotoManager triggers the mandatory OS deletion dialog
+    final List<String> result = await PhotoManager.editor.deleteWithIds([currentAsset.id]);
+    
+    if (result.isNotEmpty) {
+      setState(() {
+        _images.removeAt(_currentIndex);
+        if (_currentIndex >= _images.length && _images.isNotEmpty) {
+          _currentIndex = _images.length - 1;
+        }
+      });
     }
   }
 
@@ -170,25 +142,6 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
 
   @override
   Widget build(BuildContext context) {
-    if (_permissionDenied) {
-      return Scaffold(
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Text('STORAGE PERMISSION NEEDED', style: TextStyle(color: Colors.white70)),
-              const SizedBox(height: 16),
-              OutlinedButton(
-                style: OutlinedButton.styleFrom(side: const BorderSide(color: Colors.white)),
-                onPressed: () => PhotoManager.openSetting(),
-                child: const Text('OPEN SETTINGS', style: TextStyle(color: Colors.white)),
-              )
-            ],
-          ),
-        ),
-      );
-    }
-
     if (_isLoading) {
       return const Scaffold(
         body: Center(
@@ -197,10 +150,40 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
       );
     }
 
+    if (!_hasAccess) {
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Text(
+                'STORAGE ACCESS REQUIRED',
+                style: TextStyle(color: Colors.white, letterSpacing: 1.5, fontSize: 13),
+              ),
+              const SizedBox(height: 12),
+              const Text(
+                'Select "Allow all" in Android settings.',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+              const SizedBox(height: 20),
+              OutlinedButton(
+                style: OutlinedButton.styleFrom(
+                  side: const BorderSide(color: Colors.white38),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(4)),
+                ),
+                onPressed: () => PhotoManager.openSetting(),
+                child: const Text('OPEN SETTINGS', style: TextStyle(color: Colors.white, fontSize: 12)),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
     if (_images.isEmpty) {
       return const Scaffold(
         body: Center(
-          child: Text('NO PHOTOS FOUND', style: TextStyle(color: Colors.white38)),
+          child: Text('NO PHOTOS FOUND', style: TextStyle(color: Colors.white24, letterSpacing: 2.0)),
         ),
       );
     }
@@ -211,6 +194,7 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
     return Scaffold(
       body: Stack(
         children: [
+          // Vertical Reels-Style Snap
           PageView.builder(
             scrollDirection: Axis.vertical,
             itemCount: _images.length,
@@ -222,27 +206,26 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
             itemBuilder: (context, index) {
               return GestureDetector(
                 onDoubleTap: () => _toggleFavorite(_images[index].id),
-                child: Center(
-                  child: FutureBuilder<File?>(
-                    future: _images[index].file,
-                    builder: (context, snapshot) {
-                      if (snapshot.connectionState == ConnectionState.done && snapshot.data != null) {
-                        return Image.file(
-                          snapshot.data!,
-                          fit: BoxFit.contain,
-                          width: double.infinity,
-                          height: double.infinity,
-                        );
-                      }
-                      return const Center(
-                        child: CircularProgressIndicator(color: Colors.white12, strokeWidth: 1.0),
-                      );
-                    },
-                  ),
+                // Optimized image loader: does not crash RAM on 50MP shots
+                child: AssetEntityImage(
+                  _images[index],
+                  isOriginal: false,
+                  thumbnailSize: const ThumbnailSize(1080, 2400),
+                  fit: BoxFit.contain,
+                  width: double.infinity,
+                  height: double.infinity,
+                  loadingBuilder: (context, child, progress) {
+                    if (progress == null) return child;
+                    return const Center(
+                      child: CircularProgressIndicator(color: Colors.white10, strokeWidth: 1.0),
+                    );
+                  },
                 ),
               );
             },
           ),
+
+          // Nothing Red Animated Heart
           Center(
             child: AnimatedBuilder(
               animation: _heartAnimController,
@@ -253,7 +236,7 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
                     scale: _heartScale.value,
                     child: const Icon(
                       Icons.favorite,
-                      color: Color(0xFFD71921),
+                      color: Color(0xFFD71921), // Nothing Red
                       size: 90,
                     ),
                   ),
@@ -261,17 +244,19 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
               },
             ),
           ),
+
+          // Top Info Bar
           SafeArea(
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Text(
                     '${(_currentIndex + 1).toString().padLeft(2, '0')} / ${_images.length.toString().padLeft(2, '0')}',
                     style: const TextStyle(
-                      color: Colors.white70,
-                      letterSpacing: 2.0,
+                      color: Colors.white60,
+                      letterSpacing: 2.5,
                       fontSize: 12,
                     ),
                   ),
@@ -279,12 +264,12 @@ class _GalleryScreenState extends State<GalleryScreen> with SingleTickerProvider
                     children: [
                       if (isFav)
                         const Padding(
-                          padding: EdgeInsets.only(right: 12),
+                          padding: EdgeInsets.only(right: 14),
                           child: Icon(Icons.favorite, color: Color(0xFFD71921), size: 18),
                         ),
-                      IconButton(
-                        icon: const Icon(Icons.delete_outline, color: Colors.white70, size: 20),
-                        onPressed: _deleteCurrentImage,
+                      GestureDetector(
+                        onTap: _deleteCurrentImage,
+                        child: const Icon(Icons.delete_outline, color: Colors.white60, size: 20),
                       ),
                     ],
                   ),
